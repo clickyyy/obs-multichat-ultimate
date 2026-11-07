@@ -1,0 +1,380 @@
+﻿// Panel de administración "OBS MULTICHAT ULTIMATE" (dock de Qt dentro de OBS).
+// Solo contiene controles que ya están conectados a funcionalidad real.
+#include "hub.hpp"
+#include "music_client.hpp"
+#include "plugin_api.hpp"
+#include "twitch_client.hpp"
+#include <QCheckBox>
+#include <QColorDialog>
+#include <QComboBox>
+#include <QDateTime>
+#include <QFontComboBox>
+#include <QFormLayout>
+#include <QGroupBox>
+#include <QHBoxLayout>
+#include <QLabel>
+#include <QLineEdit>
+#include <QPushButton>
+#include <QScrollArea>
+#include <QSlider>
+#include <QSpinBox>
+#include <QTabWidget>
+#include <QVBoxLayout>
+#include <memory>
+
+using namespace mcu;
+
+static const char *QSS = R"(
+QWidget{background:#16161c;color:#e7e7ee;font-size:12px}
+QTabWidget::pane{border:0}
+QTabBar::tab{background:transparent;color:#9a9ab0;padding:8px 12px;border:0}
+QTabBar::tab:selected{color:#fff;border-bottom:2px solid #8b5cf6}
+QGroupBox{border:1px solid #2a2a36;border-radius:8px;margin-top:12px;padding:12px 8px 8px 8px}
+QGroupBox::title{subcontrol-origin:margin;left:10px;color:#a78bfa}
+QPushButton{background:#2a2a36;border:0;border-radius:6px;padding:6px 12px}
+QPushButton:hover{background:#34344a}
+QPushButton#primary{background:#7c3aed;color:#fff}
+QPushButton#primary:hover{background:#8b5cf6}
+QLineEdit,QComboBox,QSpinBox,QFontComboBox{background:#1f1f29;border:1px solid #2f2f3d;border-radius:6px;padding:4px 6px}
+QSlider::groove:horizontal{height:4px;background:#2f2f3d;border-radius:2px}
+QSlider::handle:horizontal{background:#8b5cf6;width:12px;margin:-4px 0;border-radius:6px}
+QCheckBox::indicator{width:14px;height:14px;border-radius:3px;border:1px solid #4a4a5e;background:#1f1f29}
+QCheckBox::indicator:checked{background:#7c3aed;border-color:#7c3aed}
+)";
+
+static QString stateText(int s, const QString &detail)
+{
+	static const char *names[] = {"Desconectado", "Conectando…", "Conectado", "Error"};
+	QString t = QString::fromUtf8(names[qBound(0, s, 3)]);
+	return detail.isEmpty() ? t : t + " — " + detail;
+}
+
+static QString stateColor(int s)
+{
+	return s == 2 ? "#22c55e" : s == 1 ? "#f59e0b" : s == 3 ? "#ef4444" : "#6b7280";
+}
+
+QWidget *mcuCreateDock(TwitchClient *twitch, MusicClient *music)
+{
+	auto &hub = MessageHub::instance();
+	auto *root = new QWidget();
+	root->setStyleSheet(QSS);
+	auto *rootLayout = new QVBoxLayout(root);
+	rootLayout->setContentsMargins(0, 0, 0, 0);
+	auto *tabs = new QTabWidget();
+	rootLayout->addWidget(tabs);
+
+	auto page = [&](const QString &title) {
+		auto *scroll = new QScrollArea();
+		scroll->setWidgetResizable(true);
+		scroll->setFrameShape(QFrame::NoFrame);
+		auto *w = new QWidget();
+		auto *l = new QVBoxLayout(w);
+		l->setAlignment(Qt::AlignTop);
+		scroll->setWidget(w);
+		tabs->addTab(scroll, title);
+		return l;
+	};
+
+	// ------------------------------------------------------------ Dashboard
+	{
+		auto *l = page("Dashboard");
+		auto *g = new QGroupBox("Plataformas");
+		auto *fl = new QFormLayout(g);
+		struct P { const char *id, *name; };
+		static const P plats[] = {{"twitch", "Twitch"}, {"youtube", "YouTube Live"}, {"kick", "Kick"}, {"tiktok", "TikTok Live"}, {"starvios", "Starvios Stream"}};
+		auto *labels = new QHash<QString, QLabel *>();
+		for (auto &p : plats) {
+			auto *lb = new QLabel();
+			bool impl = QString(p.id) == "twitch";
+			lb->setText(impl ? stateText(0, {}) : "No disponible en esta versión");
+			lb->setStyleSheet(QString("color:%1").arg(impl ? stateColor(0) : "#6b7280"));
+			labels->insert(p.id, lb);
+			fl->addRow(p.name, lb);
+		}
+		l->addWidget(g);
+
+		auto *stats = new QGroupBox("Actividad");
+		auto *sl = new QFormLayout(stats);
+		auto *cnt = new QLabel("0");
+		auto *hid = new QLabel("0");
+		auto *last = new QLabel("—");
+		last->setWordWrap(true);
+		sl->addRow("Mensajes mostrados", cnt);
+		sl->addRow("Mensajes filtrados", hid);
+		sl->addRow("Último mensaje", last);
+		sl->addRow("Reloj y Now Playing", new QLabel("Se añaden como fuentes y se configuran en sus propiedades"));
+		l->addWidget(stats);
+
+		auto *test = new QPushButton("Enviar mensaje de prueba");
+		test->setObjectName("primary");
+		l->addWidget(test);
+		auto *counter = new int(0);
+		QObject::connect(test, &QPushButton::clicked, root, [counter] {
+			static const char *pl[] = {"twitch", "youtube", "kick", "tiktok", "starvios"};
+			ChatMessage m;
+			m.platform = pl[*counter % 5];
+			m.id = "test-" + std::to_string(QDateTime::currentMSecsSinceEpoch()) + "-" + std::to_string((*counter)++);
+			m.user = "PruebaMultichat";
+			m.text = "Mensaje de prueba ✔ ñandú áéíóú";
+			m.badges = {"moderator"};
+			m.timestampMs = QDateTime::currentMSecsSinceEpoch();
+			MessageHub::instance().submit(m);
+		});
+
+		QObject::connect(&hub, &MessageHub::statusChanged, root, [labels](const QString &p, int s, const QString &d) {
+			if (auto *lb = labels->value(p)) {
+				lb->setText(stateText(s, d));
+				lb->setStyleSheet(QString("color:%1").arg(stateColor(s)));
+			}
+		});
+		QObject::connect(&hub, &MessageHub::statsChanged, root, [cnt, hid, last] {
+			auto &h = MessageHub::instance();
+			cnt->setText(QString::number(h.received()));
+			hid->setText(QString::number(h.hidden()));
+			last->setText(h.lastMessage().left(160));
+		});
+	}
+
+	// ------------------------------------------------------------ Plataformas
+	{
+		auto *l = page("Plataformas");
+		auto *g = new QGroupBox("Twitch (lectura anónima del chat, sin iniciar sesión)");
+		auto *fl = new QFormLayout(g);
+		auto *chan = new QLineEdit(hub.twitchChannel());
+		chan->setPlaceholderText("nombre del canal");
+		auto *auto_ = new QCheckBox("Conectar automáticamente al abrir OBS");
+		auto_->setChecked(hub.twitchAutoConnect());
+		auto *row = new QWidget();
+		auto *rl = new QHBoxLayout(row);
+		rl->setContentsMargins(0, 0, 0, 0);
+		auto *con = new QPushButton("Conectar");
+		con->setObjectName("primary");
+		auto *dis = new QPushButton("Desconectar");
+		rl->addWidget(con);
+		rl->addWidget(dis);
+		auto *st = new QLabel(stateText(0, {}));
+		fl->addRow("Canal", chan);
+		fl->addRow(auto_);
+		fl->addRow(row);
+		fl->addRow("Estado", st);
+		l->addWidget(g);
+		QObject::connect(con, &QPushButton::clicked, root, [=] {
+			MessageHub::instance().setTwitch(chan->text().trimmed(), auto_->isChecked());
+			twitch->connectToChannel(chan->text());
+		});
+		QObject::connect(dis, &QPushButton::clicked, root, [=] { twitch->disconnectFromChannel(); });
+		QObject::connect(auto_, &QCheckBox::toggled, root, [=] { MessageHub::instance().setTwitch(chan->text().trimmed(), auto_->isChecked()); });
+		QObject::connect(&hub, &MessageHub::statusChanged, root, [st](const QString &p, int s, const QString &d) {
+			if (p == "twitch") {
+				st->setText(stateText(s, d));
+				st->setStyleSheet(QString("color:%1").arg(stateColor(s)));
+			}
+		});
+
+		auto *n = new QLabel("YouTube Live, Kick, TikTok Live y Starvios Stream todavía no están implementados. "
+				     "Consulta docs/PLATFORMS.md para ver qué requiere cada una.");
+		n->setWordWrap(true);
+		n->setStyleSheet("color:#9a9ab0");
+		l->addWidget(n);
+	}
+
+	// ------------------------------------------------------------ Música
+{
+	auto *l = page("Música");
+	auto *g = new QGroupBox("Música que suena en Windows");
+	auto *fl = new QFormLayout(g);
+	auto *on = new QCheckBox("Leer la música en reproducción");
+	on->setChecked(hub.musicEnabled());
+	auto *src = new QComboBox();
+	src->addItem("Automático (el que esté sonando)", QString());
+	auto *st = new QLabel(stateText(0, {}));
+	auto *now = new QLabel("—");
+	now->setWordWrap(true);
+	fl->addRow(on);
+	fl->addRow("Reproductor", src);
+	fl->addRow("Estado", st);
+	fl->addRow("Sonando", now);
+	l->addWidget(g);
+
+	auto saved = std::make_shared<QString>(hub.musicSource());
+	QObject::connect(on, &QCheckBox::toggled, root, [=](bool v) {
+		MessageHub::instance().setMusic(v, *saved);
+		music->setEnabled(v);
+	});
+	QObject::connect(src, &QComboBox::activated, root, [=](int i) {
+		*saved = src->itemData(i).toString();
+		MessageHub::instance().setMusic(on->isChecked(), *saved);
+		music->setPreferred(*saved);
+	});
+	QObject::connect(music, &MusicClient::sessionsChanged, root, [=](const QStringList &ids, const QStringList &names) {
+		src->clear();
+		src->addItem("Automático (el que esté sonando)", QString());
+		for (int i = 0; i < ids.size(); ++i)
+			src->addItem(names.value(i), ids.value(i));
+		src->setCurrentIndex(qMax(0, src->findData(*saved)));
+	});
+	QObject::connect(music, &MusicClient::trackChanged, root, [now](const QString &t) { now->setText(t.isEmpty() ? QString::fromUtf8("—") : t); });
+	QObject::connect(&hub, &MessageHub::statusChanged, root, [st](const QString &p, int s, const QString &d) {
+		if (p == "music") {
+			st->setText(stateText(s, d));
+			st->setStyleSheet(QString("color:%1").arg(stateColor(s)));
+		}
+	});
+
+	auto *n = new QLabel("Lee lo que Windows muestra en su control de medios: Spotify, Amazon Music, "
+					 "YouTube Music o Spotify web en Chrome, Edge u Opera, etc. "
+					 "Para verlo en pantalla añade la fuente Fuentes ▸ + ▸ OBS Now Playing.");
+	n->setWordWrap(true);
+	n->setStyleSheet("color:#9a9ab0");
+	l->addWidget(n);
+}
+
+	// ------------------------------------------------------------ Diseño del chat
+	{
+		auto *l = page("Diseño del chat");
+		QJsonObject st = hub.style();
+		auto *g = new QGroupBox("Aspecto (se aplica al instante a todas las fuentes)");
+		auto *fl = new QFormLayout(g);
+
+		auto combo = [&](const QString &label, const QString &key, const QList<QPair<QString, QString>> &items, const QString &def) {
+			auto *c = new QComboBox();
+			for (auto &it : items) c->addItem(it.second, it.first);
+			int i = c->findData(st.value(key).toString(def));
+			c->setCurrentIndex(qMax(0, i));
+			QObject::connect(c, &QComboBox::currentIndexChanged, root, [c, key] { MessageHub::instance().setStyleValue(key, c->currentData().toString()); });
+			fl->addRow(label, c);
+		};
+		auto spin = [&](const QString &label, const QString &key, int lo, int hi, int def) {
+			auto *s = new QSpinBox();
+			s->setRange(lo, hi);
+			s->setValue(st.value(key).isUndefined() ? def : st.value(key).toInt(def));
+			QObject::connect(s, &QSpinBox::valueChanged, root, [key](int v) { MessageHub::instance().setStyleValue(key, v); });
+			fl->addRow(label, s);
+		};
+		auto check = [&](const QString &label, const QString &key, bool def) {
+			auto *c = new QCheckBox(label);
+			c->setChecked(st.value(key).toBool(def));
+			QObject::connect(c, &QCheckBox::toggled, root, [key](bool v) { MessageHub::instance().setStyleValue(key, v); });
+			fl->addRow(c);
+		};
+		auto color = [&](const QString &label, const QString &key) {
+			auto *b = new QPushButton(st.contains(key) ? st.value(key).toString() : "Del tema");
+			QObject::connect(b, &QPushButton::clicked, root, [b, key] {
+				QColor c = QColorDialog::getColor(Qt::white, b, "Elegir color");
+				if (c.isValid()) {
+					b->setText(c.name());
+					MessageHub::instance().setStyleValue(key, c.name());
+				}
+			});
+			fl->addRow(label, b);
+		};
+
+		combo("Tema", "theme", {{"minimal", "Minimalista"}, {"clean", "Apple / Clean UI"}, {"glass", "Glassmorphism"}, {"neon", "Neon Gaming"},
+					{"cyberpunk", "Cyberpunk"}, {"elegant", "Dark Elegant"}, {"twitch", "Modern Twitch"}, {"pastel", "Soft Pastel"},
+					{"transparent", "Transparent"}, {"premium", "Gradient Premium"}}, "twitch");
+
+		auto *font = new QFontComboBox(); // fuentes instaladas en el sistema
+		if (st.contains("fontFamily")) font->setCurrentFont(QFont(st.value("fontFamily").toString()));
+		QObject::connect(font, &QFontComboBox::currentFontChanged, root, [](const QFont &f) { MessageHub::instance().setStyleValue("fontFamily", f.family()); });
+		fl->addRow("Fuente", font);
+
+		spin("Tamaño de texto", "fontSize", 10, 96, 22);
+		spin("Separación entre mensajes", "gap", 0, 60, 8);
+		spin("Esquinas redondeadas (px, -1 = tema)", "radius", -1, 60, -1);
+		spin("Grosor del borde (px, -1 = tema)", "borderWidth", -1, 12, -1);
+		combo("Fondo", "bgMode", {{"theme", "Del tema"}, {"solid", "Un solo color"}, {"random", "Aleatorio"}, {"platform", "Según plataforma"},
+					  {"user", "Según usuario"}, {"type", "Según tipo de mensaje"}, {"none", "Sin fondo"}}, "theme");
+		color("Color de fondo (modo 'Un solo color')", "bgColor");
+
+		auto *op = new QSlider(Qt::Horizontal);
+		op->setRange(0, 100);
+		op->setValue((int)(st.value("bgOpacity").toDouble(0.9) * 100));
+		QObject::connect(op, &QSlider::valueChanged, root, [](int v) { MessageHub::instance().setStyleValue("bgOpacity", v / 100.0); });
+		fl->addRow("Opacidad del fondo", op);
+
+		color("Color del nombre", "nameColor");
+		color("Color del mensaje", "textColor");
+		color("Color del borde", "borderColor");
+		combo("Animación", "animation", {{"slideUp", "Slide Up"}, {"slideDown", "Slide Down"}, {"slideLeft", "Slide Left"}, {"slideRight", "Slide Right"},
+						 {"fade", "Fade"}, {"scale", "Scale In"}, {"pop", "Pop In"}}, "slideUp");
+		spin("Duración de animación (ms)", "animMs", 0, 3000, 350);
+		combo("Curva", "ease", {{"ease-out", "Ease out"}, {"ease-in-out", "Ease in-out"}, {"linear", "Lineal"}, {"cubic-bezier(.2,.9,.3,1.3)", "Rebote suave"}}, "ease-out");
+		spin("Tiempo de permanencia (s, 0 = infinito)", "lifetime", 0, 600, 0);
+		check("Mostrar insignias", "showBadges", true);
+		check("Mostrar punto de color de la plataforma", "showPlatform", true);
+		l->addWidget(g);
+
+		auto *reset = new QPushButton("Restablecer valores predeterminados");
+		QObject::connect(reset, &QPushButton::clicked, root, [] { MessageHub::instance().resetStyle(); });
+		l->addWidget(reset);
+		auto *n = new QLabel("Reinicia el panel (cerrar y abrir el dock) para ver los controles en su valor por defecto tras restablecer.");
+		n->setWordWrap(true);
+		n->setStyleSheet("color:#9a9ab0");
+		l->addWidget(n);
+	}
+
+	// ------------------------------------------------------------ Filtros
+	{
+		auto *l = page("Filtros");
+		auto *g = new QGroupBox("Mensajes");
+		auto *v = new QVBoxLayout(g);
+		auto chk = [&](const QString &text, const QString &key, bool def) {
+			auto *c = new QCheckBox(text);
+			c->setChecked(def);
+			QObject::connect(c, &QCheckBox::toggled, root, [key](bool on) { MessageHub::instance().setFilterBool(key, on); });
+			v->addWidget(c);
+		};
+		const auto &f = hub.filters();
+		chk("Ocultar bots (Nightbot, StreamElements, etc.)", "hideBots", f.hideBots);
+		chk("Ocultar comandos (!comando)", "hideCommands", f.hideCommands);
+		chk("Ocultar enlaces", "hideLinks", f.hideLinks);
+		chk("Mostrar solo mensajes destacados", "onlyHighlighted", f.onlyHighlighted);
+		chk("Mostrar mensajes de moderadores", "showModerators", f.showModerators);
+		chk("Mostrar mensajes de suscriptores", "showSubscribers", f.showSubscribers);
+		l->addWidget(g);
+
+		auto *g2 = new QGroupBox("Listas (separadas por comas)");
+		auto *fl = new QFormLayout(g2);
+		auto list = [&](const QString &label, const QString &key) {
+			auto *e = new QLineEdit(hub.filterList(key).join(", "));
+			QObject::connect(e, &QLineEdit::editingFinished, root, [e, key] {
+				QStringList out;
+				for (auto s : e->text().split(',', Qt::SkipEmptyParts))
+					if (!s.trimmed().isEmpty()) out << s.trimmed();
+				MessageHub::instance().setFilterList(key, out);
+			});
+			fl->addRow(label, e);
+		};
+		list("Usuarios bloqueados", "blockedUsers");
+		list("Palabras bloqueadas", "blockedWords");
+		list("Nombres de bots", "botNames");
+		l->addWidget(g2);
+
+		auto *g3 = new QGroupBox("Plataformas visibles");
+		auto *v3 = new QVBoxLayout(g3);
+		static const char *ids[] = {"twitch", "youtube", "kick", "tiktok", "starvios"};
+		static const char *names[] = {"Twitch", "YouTube Live", "Kick", "TikTok Live", "Starvios Stream"};
+		for (int i = 0; i < 5; ++i) {
+			auto *c = new QCheckBox(names[i]);
+			c->setChecked(f.enabledPlatforms.count(ids[i]) > 0);
+			QString id = ids[i];
+			QObject::connect(c, &QCheckBox::toggled, root, [id](bool on) { MessageHub::instance().setPlatformEnabled(id, on); });
+			v3->addWidget(c);
+		}
+		l->addWidget(g3);
+	}
+
+	// ------------------------------------------------------------ Acerca
+	{
+		auto *l = page("Acerca del plugin");
+		auto *t = new QLabel("<b>OBS MULTICHAT ULTIMATE</b> 0.1.0<br><br>"
+				     "Funcional en esta versión: chat de Twitch, filtros, temas, 4 modos de chat, reloj, Now Playing (música de Windows).<br>"
+				     "Pendiente: YouTube, Kick, TikTok, Starvios, conexión directa con la API de Spotify.<br><br>"
+				     "Añade las fuentes desde Fuentes ▸ + ▸ OBS Multichat …");
+		t->setWordWrap(true);
+		l->addWidget(t);
+	}
+	return root;
+}
+
